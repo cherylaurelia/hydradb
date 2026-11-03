@@ -191,9 +191,9 @@ Before execution, the service:
 6. Applies cancellation and the selected consistency mode.
 7. Returns bounded pages and a durable sequence bookmark.
 
-Bolt supports Neo4j-driver auto-commit query flow and routing. Write-capable
-clustered clients use a routing URI such as `neo4j://`, `neo4j+s://`, or
-`neo4j+ssc://`. Direct `bolt://` node connections bypass routing and are meant
+Bolt supports Neo4j-driver auto-commit query flow, transactions holding one
+statement, and routing. Write-capable clustered clients use a routing URI such
+as `neo4j://`, `neo4j+s://`, or `neo4j+ssc://`. Direct `bolt://` node connections bypass routing and are meant
 for diagnostics or targeted failure tests.
 
 Explicit transactions spanning multiple `RUN` requests are not exposed. Each

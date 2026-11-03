@@ -219,10 +219,27 @@ fn bolt_integer_overflow(value: u64) -> BoltError {
     }
 }
 
-pub(super) fn explicit_transactions_unsupported() -> BoltError {
-    BoltError::Transaction(
-        "explicit transactions are not supported; use auto-commit RUN queries".to_string(),
-    )
+pub(super) fn second_transaction_statement_unsupported() -> BoltError {
+    BoltError::Query {
+        code: "Neo.ClientError.Request.Invalid".to_string(),
+        message: "a transaction holds one statement, and nothing in this one was applied; \
+                  run each statement on its own"
+            .to_string(),
+    }
+}
+
+pub(super) fn transaction_write_in_read_mode() -> BoltError {
+    BoltError::Query {
+        code: "Neo.ClientError.Statement.AccessMode".to_string(),
+        message: "a write cannot run in a read transaction".to_string(),
+    }
+}
+
+pub(super) fn transaction_write_returns_rows() -> BoltError {
+    BoltError::Query {
+        code: "Neo.ClientError.Request.Invalid".to_string(),
+        message: "a write in a transaction runs at COMMIT, so it cannot return rows".to_string(),
+    }
 }
 
 pub(super) fn graph_error_to_bolt(error: GraphError) -> BoltError {

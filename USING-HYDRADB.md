@@ -928,12 +928,15 @@ may mean a budget was hit, not that the data is missing.**
 
 ## Transactions
 
-Auto-commit only. Bolt `BEGIN`, `COMMIT`, and `ROLLBACK` are rejected. Each
-`RUN` or HTTP request commits on its own. That rules out the drivers'
-`execute_query`, `execute_read` and `execute_write`, which all send `BEGIN`; use
-`session.run`. Design writes to be idempotent — see
-[Identity and idempotency](#identity-and-idempotency) — rather than relying on
-rollback.
+Each statement commits on its own. A Bolt transaction holds **one statement**,
+which is what `execute_query` and a one-query `execute_read` or `execute_write`
+send. A second statement is rejected, with nothing applied.
+
+A write in a transaction runs at `COMMIT`, so `ROLLBACK` discards it and its
+errors arrive at `COMMIT`. It can't return rows; use `session.run` for
+`RETURN count(n)`. `execute_read` rejects a write. If `COMMIT` is interrupted, by
+a lost connection or a `RESET`, the outcome is unknown, so design writes to be
+idempotent — see [Identity and idempotency](#identity-and-idempotency).
 
 ## Checklist before you ship
 

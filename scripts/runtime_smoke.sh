@@ -78,6 +78,7 @@ fi
 GRAPH_RUNTIME_SMOKE_TOKEN="$TOKEN" "$PYTHON" - <<'PY'
 import os
 from neo4j import GraphDatabase
+from neo4j.exceptions import ClientError
 
 with GraphDatabase.driver(
     "bolt://127.0.0.1:17687",
@@ -107,6 +108,87 @@ with GraphDatabase.driver(
                 "MATCH (a {id: 1})-[:FOLLOWS]->(b) RETURN b.id AS id"
             ))
             assert [row["id"] for row in rows] == [destination], (database, rows)
+
+    # execute_query and transaction functions send BEGIN, RUN, PULL, COMMIT.
+    write = "MERGE (a {id: $src})-[:TX]->(b {id: $dst})"
+    read = "MATCH (a {id: $src})-[:TX]->(b) RETURN b.id AS id"
+    with driver.session(database="default") as session:
+        def edges(src):
+            return [row["id"] for row in session.run(read, src=src)]
+
+        driver.execute_query(write, src=10, dst=11, database_="default")
+        assert edges(10) == [11]
+        records = driver.execute_query(read, src=10, database_="default").records
+        assert [row["id"] for row in records] == [11], records
+        session.execute_write(lambda tx: tx.run(write, src=20, dst=21).consume())
+        assert session.execute_read(lambda tx: tx.run(read, src=20).data()) == [{"id": 21}]
+
+        tx = session.begin_transaction()
+        tx.run(write, src=30, dst=31).consume()
+        tx.rollback()
+        assert edges(30) == []
+
+        def two_statements(tx):
+            tx.run(write, src=40, dst=41).consume()
+            tx.run(write, src=40, dst=42).consume()
+
+        try:
+            session.execute_write(two_statements)
+        except ClientError as error:
+            assert "one statement" in error.message, error
+        else:
+            raise AssertionError("a second statement must be rejected")
+        assert edges(40) == []
+
+        def read_then_write(tx):
+            tx.run(read, src=10).consume()
+            tx.run(write, src=50, dst=51).consume()
+
+        def stream_then_run(tx):
+            first = tx.run(read, src=60)
+            next(iter(first))
+            tx.run(read, src=10)
+
+        def write_in_read(tx):
+            tx.run(write, src=70, dst=71).consume()
+
+        def refused(run, text):
+            try:
+                run()
+            except ClientError as error:
+                assert text in error.message, error
+            else:
+                raise AssertionError(f"expected a refusal: {text}")
+
+        refused(lambda: session.execute_write(read_then_write), "one statement")
+        assert edges(50) == []
+        refused(lambda: session.execute_read(write_in_read), "read transaction")
+        assert edges(70) == []
+        session.run("MERGE (a:TX {id: 80})-[:TX]->(b {id: 81})").consume()
+        refused(
+            lambda: driver.execute_query(
+                "MATCH (a:TX {id: 80}) SET a.x = 1 RETURN count(a) AS n", database_="default"
+            ),
+            "cannot return rows",
+        )
+
+        rows = [{"src": 60, "dst": 1000 + i} for i in range(20)]
+        session.run(
+            "UNWIND $rows AS row CREATE (a {id: row.src})-[:TX]->(b {id: row.dst})", rows=rows
+        ).consume()
+        with driver.session(database="default", fetch_size=5) as paged:
+            refused(lambda: paged.execute_read(stream_then_run), "one statement")
+
+        with driver.session(database="default") as bookmarked:
+            bookmarked.execute_write(lambda tx: tx.run(write, src=90, dst=91).consume())
+            assert bookmarked.last_bookmarks().raw_values
+
+    scoped = "default.scope1.dGVuYW50LWE.Y29sbGVjdGlvbi1h"
+    driver.execute_query(write, src=95, dst=96, database_=scoped, bookmark_manager_=None)
+    with driver.session(database=scoped) as session:
+        assert session.run(read, src=95).single(strict=True)["id"] == 96
+    with driver.session(database="default") as session:
+        assert session.run(read, src=95).single() is None
 PY
 
 http_result="$(curl -fsS -X POST \

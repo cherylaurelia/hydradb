@@ -43,8 +43,9 @@ pub use routing::{
     ObjectStoreBoltRoutingTableProvider,
 };
 use values::{
-    bolt_parameter_to_query_value, explicit_transactions_unsupported, graph_error_to_bolt,
-    highest_matching_bookmark, query_value_to_bolt,
+    bolt_parameter_to_query_value, graph_error_to_bolt, highest_matching_bookmark,
+    query_value_to_bolt, second_transaction_statement_unsupported, transaction_write_in_read_mode,
+    transaction_write_returns_rows,
 };
 use wire::{bolt_server_handshake, read_bolt_messages};
 
@@ -560,6 +561,7 @@ enum BoltState {
     Negotiation,
     Authentication,
     Ready,
+    Transaction,
     Streaming,
     Failed,
 }
@@ -570,6 +572,18 @@ struct BoltProtocolSession {
     database: Option<String>,
     next_query: u64,
     pending: Option<PendingBoltResult>,
+    transaction: Option<BoltTransaction>,
+}
+
+/// An open `BEGIN`. It holds one statement, which is what the drivers'
+/// `execute_query` sends, so the auto-commit guarantee is unchanged: a read runs
+/// as usual, and a write waits for `COMMIT` so that `ROLLBACK`, or a rejected
+/// second statement, leaves nothing applied.
+struct BoltTransaction {
+    extra: BoltDict,
+    statement_seen: bool,
+    deferred_write: Option<PendingBoltResult>,
+    bookmark: Option<ClientBookmark>,
 }
 
 impl BoltProtocolSession {
@@ -583,6 +597,7 @@ impl BoltProtocolSession {
             database: None,
             next_query: 1,
             pending: None,
+            transaction: None,
         }
     }
 
@@ -602,6 +617,9 @@ impl BoltProtocolSession {
 struct PendingBoltResult {
     database: String,
     prepared: PreparedClientQuery,
+    /// Set on a write inside a transaction: PULL answers without running it,
+    /// and COMMIT runs it.
+    deferred_until_commit: bool,
     deadline: Instant,
     columns: Vec<QueryColumn>,
     started: bool,
@@ -762,6 +780,7 @@ async fn run_bolt_protocol(
             match message {
                 ClientMessage::Reset => {
                     clear_pending_result(&context, &mut session).await;
+                    session.transaction = None;
                     send_bolt_success(&mut writer, BoltDict::new()).await?;
                     state = if session.authenticated.is_some() {
                         BoltState::Ready
@@ -832,8 +851,10 @@ async fn run_bolt_protocol(
                 break;
             }
             (BoltState::Ready, ClientMessage::Reset)
+            | (BoltState::Transaction, ClientMessage::Reset)
             | (BoltState::Streaming, ClientMessage::Reset) => {
                 clear_pending_result(&context, &mut session).await;
+                session.transaction = None;
                 send_bolt_success(&mut writer, BoltDict::new()).await?;
                 state = BoltState::Ready;
             }
@@ -845,14 +866,82 @@ async fn run_bolt_protocol(
                 send_bolt_success(&mut writer, BoltDict::new()).await?;
                 state = BoltState::Authentication;
             }
+            (BoltState::Ready, ClientMessage::Begin { extra }) => {
+                if let Err(error) = validate_bolt_run_extra(&extra) {
+                    send_bolt_failure(&mut writer, &error).await?;
+                    state = BoltState::Failed;
+                    continue;
+                }
+                session.transaction = Some(BoltTransaction {
+                    extra,
+                    statement_seen: false,
+                    deferred_write: None,
+                    bookmark: None,
+                });
+                send_bolt_success(&mut writer, BoltDict::new()).await?;
+                state = BoltState::Transaction;
+            }
+            (BoltState::Transaction, ClientMessage::Rollback) => {
+                session.transaction = None;
+                send_bolt_success(&mut writer, BoltDict::new()).await?;
+                state = BoltState::Ready;
+            }
+            (BoltState::Transaction, ClientMessage::Commit) => {
+                let mut channels = BoltConnectionChannels {
+                    message_rx: &mut message_rx,
+                    queued: &mut queued,
+                    writer: &mut writer,
+                    max_queued_messages: config.max_pipelined_messages,
+                };
+                let committed = commit_bolt_transaction(
+                    &context,
+                    &mut session,
+                    config.prefetch_rows,
+                    &mut channels,
+                )
+                .await?;
+                match committed {
+                    Some(next) => state = next,
+                    None => break,
+                }
+            }
+            (BoltState::Streaming, ClientMessage::Run { .. }) if session.transaction.is_some() => {
+                send_bolt_failure(&mut writer, &second_transaction_statement_unsupported()).await?;
+                state = BoltState::Failed;
+            }
+            (BoltState::Streaming, ClientMessage::Pull { .. } | ClientMessage::Discard { .. })
+                if session
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| p.deferred_until_commit) =>
+            {
+                hold_bolt_write_for_commit(&mut session, &mut writer).await?;
+                state = BoltState::Transaction;
+            }
             (
-                BoltState::Ready,
+                BoltState::Ready | BoltState::Transaction,
                 ClientMessage::Run {
                     query,
                     parameters,
                     extra,
                 },
             ) => {
+                // A statement inside a transaction takes its metadata from BEGIN.
+                let extra = match session.transaction.as_mut() {
+                    None => extra,
+                    Some(transaction) if transaction.statement_seen => {
+                        send_bolt_failure(&mut writer, &second_transaction_statement_unsupported())
+                            .await?;
+                        state = BoltState::Failed;
+                        continue;
+                    }
+                    Some(transaction) => {
+                        transaction.statement_seen = true;
+                        transaction.extra.clone()
+                    }
+                };
+                let read_only_transaction = session.transaction.is_some()
+                    && matches!(extra.get("mode"), Some(BoltValue::String(mode)) if mode == "r");
                 // Read before `extra` is consumed below. A malformed
                 // `tx_metadata` is reported by `prepare_bolt_run` a line later
                 // with the right error; there is nothing useful to say about it
@@ -926,6 +1015,22 @@ async fn run_bolt_protocol(
                         continue;
                     }
                 };
+                let deferred_until_commit =
+                    session.transaction.is_some() && prepared.action == QueryTransportAction::Write;
+                if deferred_until_commit {
+                    let refusal = if read_only_transaction {
+                        Some(transaction_write_in_read_mode())
+                    } else if !prepared.columns.is_empty() {
+                        Some(transaction_write_returns_rows())
+                    } else {
+                        None
+                    };
+                    if let Some(refusal) = refusal {
+                        send_bolt_failure(&mut writer, &refusal).await?;
+                        state = BoltState::Failed;
+                        continue;
+                    }
+                }
                 let query_deadline = Instant::now()
                     + Duration::from_millis(
                         prepared
@@ -965,6 +1070,7 @@ async fn run_bolt_protocol(
                     database,
                     columns: prepared.columns.clone(),
                     prepared,
+                    deferred_until_commit,
                     deadline: query_deadline,
                     started: false,
                     pages: 0,
@@ -1031,8 +1137,9 @@ async fn run_bolt_protocol(
                         let metadata = bolt_result_summary_metadata(pending, has_more);
                         send_bolt_success(&mut writer, metadata).await?;
                         if !has_more {
+                            let bookmark = pending.bookmark.clone();
                             clear_pending_result(&context, &mut session).await;
-                            state = BoltState::Ready;
+                            state = bolt_state_after_statement(&mut session, bookmark);
                         }
                     }
                     Ok(PageAwaitResult::Complete(Err(error))) => {
@@ -1042,6 +1149,7 @@ async fn run_bolt_protocol(
                     }
                     Ok(PageAwaitResult::Reset) => {
                         clear_pending_result(&context, &mut session).await;
+                        session.transaction = None;
                         state = BoltState::Ready;
                     }
                     Ok(PageAwaitResult::Goodbye) => break,
@@ -1106,8 +1214,9 @@ async fn run_bolt_protocol(
                         )
                         .await?;
                         if !has_more {
+                            let bookmark = pending.bookmark.clone();
                             clear_pending_result(&context, &mut session).await;
-                            state = BoltState::Ready;
+                            state = bolt_state_after_statement(&mut session, bookmark);
                         }
                     }
                     Ok(PageAwaitResult::Complete(Err(error))) => {
@@ -1117,6 +1226,7 @@ async fn run_bolt_protocol(
                     }
                     Ok(PageAwaitResult::Reset) => {
                         clear_pending_result(&context, &mut session).await;
+                        session.transaction = None;
                         state = BoltState::Ready;
                     }
                     Ok(PageAwaitResult::Goodbye) => break,
@@ -1152,13 +1262,6 @@ async fn run_bolt_protocol(
             (BoltState::Ready, ClientMessage::Telemetry { .. }) => {
                 send_bolt_success(&mut writer, BoltDict::new()).await?;
             }
-            (
-                BoltState::Ready,
-                ClientMessage::Begin { .. } | ClientMessage::Commit | ClientMessage::Rollback,
-            ) => {
-                send_bolt_failure(&mut writer, &explicit_transactions_unsupported()).await?;
-                state = BoltState::Failed;
-            }
             _ => {
                 send_bolt_failure(
                     &mut writer,
@@ -1176,6 +1279,111 @@ async fn run_bolt_protocol(
     reader_task.stop().await;
     tracing::debug!(target: "hydradb", %peer_addr, "Bolt session closed");
     Ok(())
+}
+
+/// Answers PULL or DISCARD for a write without running it, and keeps it for COMMIT.
+async fn hold_bolt_write_for_commit<W>(
+    session: &mut BoltProtocolSession,
+    writer: &mut BoltMessageWriter<W>,
+) -> std::result::Result<(), BoltError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let write = session
+        .pending
+        .take()
+        .expect("the caller saw a pending write");
+    let summary = BoltDict::from([
+        ("has_more".to_string(), BoltValue::Boolean(false)),
+        ("db".to_string(), BoltValue::String(write.database.clone())),
+        ("t_last".to_string(), BoltValue::Integer(0)),
+        ("type".to_string(), BoltValue::String("w".to_string())),
+    ]);
+    send_bolt_success(writer, summary).await?;
+    session
+        .transaction
+        .as_mut()
+        .expect("only a transaction holds a write")
+        .deferred_write = Some(write);
+    Ok(())
+}
+
+/// Ends a transaction and returns the next state, or `None` on GOODBYE.
+///
+/// A held write runs here. Its runtime budget starts now rather than at RUN, so
+/// time the client spends between the two isn't charged to it. A write with no
+/// columns holds no server cursor, so there is none to release.
+async fn commit_bolt_transaction<W>(
+    context: &Arc<BoltConnectionContext>,
+    session: &mut BoltProtocolSession,
+    prefetch_rows: usize,
+    channels: &mut BoltConnectionChannels<'_, W>,
+) -> std::result::Result<Option<BoltState>, BoltError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let transaction = session
+        .transaction
+        .take()
+        .expect("the Transaction state holds an open transaction");
+    let mut bookmark = transaction.bookmark;
+    if let Some(mut write) = transaction.deferred_write {
+        let runtime_limit_ms = write
+            .prepared
+            .request
+            .max_runtime_ms
+            .expect("Bolt requests are normalized before execution");
+        write.deadline = Instant::now() + Duration::from_millis(runtime_limit_ms);
+        let outcome = match session.authenticated() {
+            Ok(authenticated) => {
+                consume_bolt_records(
+                    context,
+                    &authenticated,
+                    &mut write,
+                    None,
+                    prefetch_rows,
+                    BoltRecordDisposition::Discard,
+                    channels,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        match outcome {
+            Err(error) => {
+                send_bolt_failure(channels.writer, &error).await?;
+                return Ok(Some(BoltState::Failed));
+            }
+            Ok(PageAwaitResult::Complete(Err(error))) => {
+                send_bolt_failure(channels.writer, &graph_error_to_bolt(error)).await?;
+                return Ok(Some(BoltState::Failed));
+            }
+            Ok(PageAwaitResult::Complete(Ok(_))) => bookmark = write.bookmark.take(),
+            Ok(PageAwaitResult::Reset) => return Ok(Some(BoltState::Ready)),
+            Ok(PageAwaitResult::Goodbye) => return Ok(None),
+        }
+    }
+    let mut metadata = BoltDict::new();
+    if let Some(bookmark) = bookmark {
+        metadata.insert("bookmark".to_string(), BoltValue::String(bookmark.encode()));
+    }
+    send_bolt_success(channels.writer, metadata).await?;
+    Ok(Some(BoltState::Ready))
+}
+
+/// The state after a statement's last record: back into its transaction, keeping
+/// the bookmark for COMMIT, or ready for the next auto-commit RUN.
+fn bolt_state_after_statement(
+    session: &mut BoltProtocolSession,
+    bookmark: Option<ClientBookmark>,
+) -> BoltState {
+    match session.transaction.as_mut() {
+        Some(transaction) => {
+            transaction.bookmark = bookmark;
+            BoltState::Transaction
+        }
+        None => BoltState::Ready,
+    }
 }
 
 async fn clear_pending_result(context: &BoltConnectionContext, session: &mut BoltProtocolSession) {
