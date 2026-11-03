@@ -226,13 +226,13 @@ The second call returns one row containing
 `{"type":"vertex_id","value":2}`. A listening port is not proof the node works;
 a round-tripped write is.
 
-For a scripted Bolt and HTTP round trip, install the Python Neo4j driver and
-run. Homebrew's and Debian's Python both refuse a bare `pip install` under
+For a scripted Bolt and HTTP round trip, install the Python Neo4j driver on
+Python 3.10 or newer and run. Homebrew's and Debian's Python both refuse a bare `pip install` under
 PEP 668, so use a virtualenv (`apt-get install -y python3-venv` on
 Debian/Ubuntu):
 
 ```bash
-python3 -m venv /tmp/hydradb-venv && /tmp/hydradb-venv/bin/pip install neo4j
+python3 -m venv /tmp/hydradb-venv && /tmp/hydradb-venv/bin/pip install 'neo4j>=6'
 
 # macOS: this script calls cargo directly, so it does not inherit what the
 # justfile exports. Without this it fails at bindgen with
@@ -257,6 +257,7 @@ Prints `runtime-smoke-ok`. The node's log is at
 | `invalid environment variable CLOUD_PROVIDER value \`null\`` | `CLOUD_PROVIDER` is unset — `null` means absent, not the string. `local` also needs `LOCAL_PATH`, pointing at a directory that already exists |
 | `wrapper.h:4:10: fatal error: 'cypher-parser.h' file not found` | `BINDGEN_EXTRA_CLANG_ARGS` unset while invoking `cargo` directly on macOS. Prefer `just`, which exports it |
 | Node answers `/readyz`, then aborts with `has overflowed its stack` on the first query | `RUST_MIN_STACK` unset; export `33554432` |
+| `UnsupportedServerProduct: SlateDBGraph/...` | Neo4j driver 5.x, which `pip` picks on Python 3.9. Use Python 3.10+ and `neo4j>=6` |
 | `curl: (7) Failed to connect ... port 9090` | The node is not running. `graph-node` holds the foreground, so start it in its own shell |
 
 ## Querying

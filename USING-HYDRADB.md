@@ -63,7 +63,8 @@ check it first when a query fails inexplicably.
 
 ### Bolt, Python
 
-Requires the driver (`pip install neo4j` — use a virtualenv on Homebrew or
+Requires the driver (`pip install 'neo4j>=6'`, on Python 3.10 or newer; driver
+5.x refuses a server whose agent isn't `Neo4j/`. Use a virtualenv on Homebrew or
 Debian Python, which refuse a bare install under PEP 668). If you cannot install
 anything, the HTTP API below needs only the standard library.
 
@@ -928,7 +929,9 @@ may mean a budget was hit, not that the data is missing.**
 ## Transactions
 
 Auto-commit only. Bolt `BEGIN`, `COMMIT`, and `ROLLBACK` are rejected. Each
-`RUN` or HTTP request commits on its own. Design writes to be idempotent — see
+`RUN` or HTTP request commits on its own. That rules out the drivers'
+`execute_query`, `execute_read` and `execute_write`, which all send `BEGIN`; use
+`session.run`. Design writes to be idempotent — see
 [Identity and idempotency](#identity-and-idempotency) — rather than relying on
 rollback.
 
