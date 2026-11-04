@@ -71,8 +71,8 @@ curl -fsS http://127.0.0.1:19091/readyz >/dev/null
 curl -fsS http://127.0.0.1:19091/metrics >"$ROOT/metrics.prom"
 grep -q graph_runtime_ready "$ROOT/metrics.prom"
 
-if ! "$PYTHON" -c 'import neo4j' >/dev/null 2>&1; then
-  echo "python neo4j package is required for runtime smoke" >&2
+if ! "$PYTHON" -c 'import sys, neo4j; sys.exit(int(neo4j.__version__.split(".")[0]) < 6)' >/dev/null 2>&1; then
+  echo "python neo4j package 6.x or later is required for runtime smoke (5.x rejects HydraDB's server agent)" >&2
   exit 2
 fi
 GRAPH_RUNTIME_SMOKE_TOKEN="$TOKEN" "$PYTHON" - <<'PY'

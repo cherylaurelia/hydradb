@@ -229,10 +229,12 @@ a round-tripped write is.
 For a scripted Bolt and HTTP round trip, install the Python Neo4j driver and
 run. Homebrew's and Debian's Python both refuse a bare `pip install` under
 PEP 668, so use a virtualenv (`apt-get install -y python3-venv` on
-Debian/Ubuntu):
+Debian/Ubuntu). The driver must be 6.x, which needs Python 3.10+. Driver 5.x
+rejects HydraDB with `UnsupportedServerProduct`, and it is what pip picks on
+macOS's stock Python 3.9, so on macOS run `brew install python` first:
 
 ```bash
-python3 -m venv /tmp/hydradb-venv && /tmp/hydradb-venv/bin/pip install neo4j
+python3 -m venv /tmp/hydradb-venv && /tmp/hydradb-venv/bin/pip install 'neo4j>=6'
 
 # macOS: this script calls cargo directly, so it does not inherit what the
 # justfile exports. Without this it fails at bindgen with

@@ -63,8 +63,9 @@ check it first when a query fails inexplicably.
 
 ### Bolt, Python
 
-Requires the driver (`pip install neo4j` — use a virtualenv on Homebrew or
-Debian Python, which refuse a bare install under PEP 668). If you cannot install
+Requires driver 6 or later (`pip install 'neo4j>=6'`, Python 3.10+; driver 5.x
+rejects HydraDB with `UnsupportedServerProduct`). Use a virtualenv on Homebrew or
+Debian Python, which refuse a bare install under PEP 668. If you cannot install
 anything, the HTTP API below needs only the standard library.
 
 ```python
